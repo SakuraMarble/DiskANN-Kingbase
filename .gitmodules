@@ -1,3 +1,6 @@
 [submodule "gperftools"]
 	path = gperftools
 	url = https://github.com/gperftools/gperftools.git
+[submodule "third_party/CRoaring"]
+	path = third_party/CRoaring
+	url = https://github.com/RoaringBitmap/CRoaring.git

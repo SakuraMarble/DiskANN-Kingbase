@@ -81,6 +81,19 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
                                               const uint32_t io_limit, const bool use_reorder_data = false,
                                               QueryStats *stats = nullptr);
 
+    // Optimized search with multi-entry points and separated navigation/result sets
+    // This method implements the improved search logic for filtered queries:
+    // - Uses multiple entry points from candidate_ids instead of global medoid
+    // - Maintains separate search_ctx (navigation) and result_heap (results)
+    // - Navigation set considers only distance, result set considers only labels
+    // - Supports backfill from candidate_ids if results are insufficient
+    DISKANN_DLLEXPORT void cached_beam_search_with_multi_entry(
+        const T *query, const uint64_t k_search, const uint64_t l_search,
+        uint64_t *res_ids, float *res_dists, const uint64_t beam_width,
+        const std::vector<uint32_t> &candidate_ids,  // Candidates from inverted index
+        const std::vector<uint32_t> &valid_label_ids, // Valid IDs for label checking (can be same as candidate_ids)
+        const bool use_reorder_data = false, QueryStats *stats = nullptr);
+
     DISKANN_DLLEXPORT LabelT get_converted_label(const std::string &filter_label);
 
     DISKANN_DLLEXPORT uint32_t range_search(const T *query1, const double range, const uint64_t min_l_search,

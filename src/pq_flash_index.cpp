@@ -1742,6 +1742,441 @@ uint32_t PQFlashIndex<T, LabelT>::range_search(const T *query1, const double ran
     return res_count;
 }
 
+// Optimized search with multi-entry points and separated navigation/result sets
+template <typename T, typename LabelT>
+void PQFlashIndex<T, LabelT>::cached_beam_search_with_multi_entry(
+    const T *query1, const uint64_t k_search, const uint64_t l_search,
+    uint64_t *indices, float *distances, const uint64_t beam_width,
+    const std::vector<uint32_t> &candidate_ids,
+    const std::vector<uint32_t> &valid_label_ids,
+    const bool use_reorder_data, QueryStats *stats)
+{
+    if (candidate_ids.empty())
+    {
+        diskann::cout << "Warning: Empty candidate_ids, returning empty results" << std::endl;
+        for (uint64_t i = 0; i < k_search; i++)
+        {
+            indices[i] = 0;
+            distances[i] = std::numeric_limits<float>::max();
+        }
+        return;
+    }
+
+    ScratchStoreManager<SSDThreadData<T>> manager(this->_thread_data);
+    auto data = manager.scratch_space();
+    IOContext &ctx = data->ctx;
+    auto query_scratch = &(data->scratch);
+    auto pq_query_scratch = query_scratch->pq_scratch();
+
+    // Reset query scratch
+    query_scratch->reset();
+
+    // Copy and normalize query
+    float query_norm = 0;
+    T *aligned_query_T = query_scratch->aligned_query_T();
+    float *query_float = pq_query_scratch->aligned_query_float;
+    float *query_rotated = pq_query_scratch->rotated_query;
+
+    if (metric == diskann::Metric::INNER_PRODUCT || metric == diskann::Metric::COSINE)
+    {
+        uint64_t inherent_dim = (metric == diskann::Metric::COSINE) ? this->_data_dim : (uint64_t)(this->_data_dim - 1);
+        for (size_t i = 0; i < inherent_dim; i++)
+        {
+            aligned_query_T[i] = query1[i];
+            query_norm += query1[i] * query1[i];
+        }
+        if (metric == diskann::Metric::INNER_PRODUCT)
+            aligned_query_T[this->_data_dim - 1] = 0;
+
+        query_norm = std::sqrt(query_norm);
+        for (size_t i = 0; i < inherent_dim; i++)
+        {
+            aligned_query_T[i] = (T)(aligned_query_T[i] / query_norm);
+        }
+        pq_query_scratch->initialize(this->_data_dim, aligned_query_T);
+    }
+    else
+    {
+        for (size_t i = 0; i < this->_data_dim; i++)
+        {
+            aligned_query_T[i] = query1[i];
+        }
+        pq_query_scratch->initialize(this->_data_dim, aligned_query_T);
+    }
+
+    // Buffers for data
+    T *data_buf = query_scratch->coord_scratch;
+    _mm_prefetch((char *)data_buf, _MM_HINT_T1);
+
+    // Sector scratch
+    char *sector_scratch = query_scratch->sector_scratch;
+    uint64_t &sector_scratch_idx = query_scratch->sector_idx;
+    const uint64_t num_sectors_per_node =
+        _nnodes_per_sector > 0 ? 1 : DIV_ROUND_UP(_max_node_len, defaults::SECTOR_LEN);
+
+    // PQ distance computation setup
+    _pq_table.preprocess_query(query_rotated);
+    float *pq_dists = pq_query_scratch->aligned_pqtable_dist_scratch;
+    _pq_table.populate_chunk_distances(query_rotated, pq_dists);
+
+    float *dist_scratch = pq_query_scratch->aligned_dist_scratch;
+    uint8_t *pq_coord_scratch = pq_query_scratch->aligned_pq_coord_scratch;
+
+    // Lambda to batch compute query <-> node distances in PQ space
+    auto compute_dists = [this, pq_coord_scratch, pq_dists](const uint32_t *ids, const uint64_t n_ids,
+                                                            float *dists_out) {
+        diskann::aggregate_coords(ids, n_ids, this->data, this->_n_chunks, pq_coord_scratch);
+        diskann::pq_dist_lookup(pq_coord_scratch, n_ids, this->_n_chunks, pq_dists, dists_out);
+    };
+
+    Timer query_timer, io_timer, cpu_timer;
+
+    // Create a set of valid label IDs for fast lookup
+    tsl::robin_set<uint32_t> valid_label_set(valid_label_ids.begin(), valid_label_ids.end());
+
+    // Visited set
+    tsl::robin_set<uint64_t> &visited = query_scratch->visited;
+
+    // search_ctx: Navigation priority queue (min-heap by distance, for graph traversal)
+    NeighborPriorityQueue &search_ctx = query_scratch->retset;
+    search_ctx.reserve(l_search);
+
+    // result_heap: Result priority queue (max-heap by distance, only for label-matched results)
+    // We'll use a std::priority_queue for max-heap behavior
+    std::priority_queue<Neighbor> result_heap; // max-heap (largest distance on top)
+
+    // Step 1: Initialize with multiple entry points from candidate_ids
+    // Randomly select up to beam_width candidates as entry points
+    std::vector<uint32_t> entry_points;
+    size_t num_entry_points = std::min((size_t)beam_width, candidate_ids.size());
+
+    if (candidate_ids.size() <= beam_width)
+    {
+        entry_points = candidate_ids;
+    }
+    else
+    {
+        // Random sampling without replacement
+        std::vector<uint32_t> shuffled = candidate_ids;
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::shuffle(shuffled.begin(), shuffled.end(), gen);
+        entry_points.assign(shuffled.begin(), shuffled.begin() + num_entry_points);
+    }
+
+    // Compute distances for entry points and add to search_ctx
+    for (uint32_t entry_id : entry_points)
+    {
+        if (entry_id >= _num_points)
+            continue;
+
+        compute_dists(&entry_id, 1, dist_scratch);
+        float entry_dist = dist_scratch[0];
+
+        search_ctx.insert(Neighbor(entry_id, entry_dist));
+        visited.insert(entry_id);
+
+        // If this entry point matches the label, also add to result_heap
+        if (valid_label_set.find(entry_id) != valid_label_set.end())
+        {
+            result_heap.push(Neighbor(entry_id, entry_dist));
+        }
+    }
+
+    uint32_t num_ios = 0;
+    uint32_t cmps = 0;
+    uint32_t hops = 0;
+    const uint32_t io_limit = std::numeric_limits<uint32_t>::max();
+
+    // Cleared every iteration
+    std::vector<uint32_t> frontier;
+    frontier.reserve(2 * beam_width);
+    std::vector<std::pair<uint32_t, char *>> frontier_nhoods;
+    frontier_nhoods.reserve(2 * beam_width);
+    std::vector<AlignedRead> frontier_read_reqs;
+    frontier_read_reqs.reserve(2 * beam_width);
+    std::vector<std::pair<uint32_t, std::pair<uint32_t, uint32_t *>>> cached_nhoods;
+    cached_nhoods.reserve(2 * beam_width);
+
+    // Step 2: Main search loop
+    while (search_ctx.has_unexpanded_node() && num_ios < io_limit)
+    {
+        // Clear iteration state
+        frontier.clear();
+        frontier_nhoods.clear();
+        frontier_read_reqs.clear();
+        cached_nhoods.clear();
+        sector_scratch_idx = 0;
+
+        // Find new beam
+        uint32_t num_seen = 0;
+        while (search_ctx.has_unexpanded_node() && frontier.size() < beam_width && num_seen < beam_width)
+        {
+            auto nbr = search_ctx.closest_unexpanded();
+            num_seen++;
+
+            // Pruning check: if search_ctx is full and current node is too far, stop
+            if (search_ctx.size() >= l_search)
+            {
+                auto furthest_in_ctx = search_ctx.furthest();
+                if (nbr.distance > furthest_in_ctx.distance)
+                {
+                    break;
+                }
+            }
+
+            auto iter = _nhood_cache.find(nbr.id);
+            if (iter != _nhood_cache.end())
+            {
+                cached_nhoods.push_back(std::make_pair(nbr.id, iter->second));
+                if (stats != nullptr)
+                {
+                    stats->n_cache_hits++;
+                }
+            }
+            else
+            {
+                frontier.push_back(nbr.id);
+            }
+
+            if (this->_count_visited_nodes)
+            {
+                reinterpret_cast<std::atomic<uint32_t> &>(this->_node_visit_counter[nbr.id].second).fetch_add(1);
+            }
+        }
+
+        // Read neighborhoods of frontier nodes
+        if (!frontier.empty())
+        {
+            if (stats != nullptr)
+                stats->n_hops++;
+
+            for (uint64_t i = 0; i < frontier.size(); i++)
+            {
+                auto id = frontier[i];
+                std::pair<uint32_t, char *> fnhood;
+                fnhood.first = id;
+                fnhood.second = sector_scratch + num_sectors_per_node * sector_scratch_idx * defaults::SECTOR_LEN;
+                sector_scratch_idx++;
+                frontier_nhoods.push_back(fnhood);
+                frontier_read_reqs.emplace_back(get_node_sector((size_t)id) * defaults::SECTOR_LEN,
+                                                num_sectors_per_node * defaults::SECTOR_LEN, fnhood.second);
+                if (stats != nullptr)
+                {
+                    stats->n_4k++;
+                    stats->n_ios++;
+                }
+                num_ios++;
+            }
+
+            io_timer.reset();
+#ifdef USE_BING_INFRA
+            reader->read(frontier_read_reqs, ctx, true);
+#else
+            reader->read(frontier_read_reqs, ctx);
+#endif
+            if (stats != nullptr)
+            {
+                stats->io_us += (float)io_timer.elapsed();
+            }
+        }
+
+        // Process cached neighborhoods
+        for (auto &cached_nhood : cached_nhoods)
+        {
+            uint64_t nnbrs = cached_nhood.second.first;
+            uint32_t *node_nbrs = cached_nhood.second.second;
+
+            cpu_timer.reset();
+            compute_dists(node_nbrs, nnbrs, dist_scratch);
+            if (stats != nullptr)
+            {
+                stats->n_cmps += (uint32_t)nnbrs;
+                stats->cpu_us += (float)cpu_timer.elapsed();
+            }
+
+            // Process neighbors
+            for (uint64_t m = 0; m < nnbrs; ++m)
+            {
+                uint32_t id = node_nbrs[m];
+                if (visited.insert(id).second)
+                {
+                    // Skip dummy points
+                    if (_dummy_pts.find(id) != _dummy_pts.end())
+                        continue;
+
+                    cmps++;
+                    float dist = dist_scratch[m];
+
+                    // Branch A: Maintain result_heap (only look at labels)
+                    if (valid_label_set.find(id) != valid_label_set.end())
+                    {
+                        if (result_heap.size() < k_search)
+                        {
+                            result_heap.push(Neighbor(id, dist));
+                        }
+                        else if (dist < result_heap.top().distance)
+                        {
+                            result_heap.pop();
+                            result_heap.push(Neighbor(id, dist));
+                        }
+                    }
+
+                    // Branch B: Maintain search_ctx (only look at distance, ignore labels)
+                    Neighbor nn(id, dist);
+                    if (search_ctx.size() < l_search || dist < search_ctx.furthest().distance)
+                    {
+                        search_ctx.insert(nn);
+                    }
+                }
+            }
+        }
+
+#ifdef USE_BING_INFRA
+        int completedIndex = -1;
+        long requestCount = static_cast<long>(frontier_read_reqs.size());
+        while (requestCount > 0 && getNextCompletedRequest(reader, ctx, requestCount, completedIndex))
+        {
+            assert(completedIndex >= 0);
+            auto &frontier_nhood = frontier_nhoods[completedIndex];
+            (*ctx.m_pRequestsStatus)[completedIndex] = IOContext::PROCESS_COMPLETE;
+#else
+        for (auto &frontier_nhood : frontier_nhoods)
+        {
+#endif
+            char *node_disk_buf = offset_to_node(frontier_nhood.second, frontier_nhood.first);
+            uint32_t *node_buf = offset_to_node_nhood(node_disk_buf);
+            uint64_t nnbrs = (uint64_t)(*node_buf);
+            uint32_t *node_nbrs = (node_buf + 1);
+
+            cpu_timer.reset();
+            compute_dists(node_nbrs, nnbrs, dist_scratch);
+            if (stats != nullptr)
+            {
+                stats->n_cmps += (uint32_t)nnbrs;
+                stats->cpu_us += (float)cpu_timer.elapsed();
+            }
+
+            // Process neighbors
+            for (uint64_t m = 0; m < nnbrs; ++m)
+            {
+                uint32_t id = node_nbrs[m];
+                if (visited.insert(id).second)
+                {
+                    // Skip dummy points
+                    if (_dummy_pts.find(id) != _dummy_pts.end())
+                        continue;
+
+                    cmps++;
+                    float dist = dist_scratch[m];
+                    if (stats != nullptr)
+                    {
+                        stats->n_cmps++;
+                    }
+
+                    // Branch A: Maintain result_heap (only look at labels)
+                    if (valid_label_set.find(id) != valid_label_set.end())
+                    {
+                        if (result_heap.size() < k_search)
+                        {
+                            result_heap.push(Neighbor(id, dist));
+                        }
+                        else if (dist < result_heap.top().distance)
+                        {
+                            result_heap.pop();
+                            result_heap.push(Neighbor(id, dist));
+                        }
+                    }
+
+                    // Branch B: Maintain search_ctx (only look at distance, ignore labels)
+                    Neighbor nn(id, dist);
+                    if (search_ctx.size() < l_search || dist < search_ctx.furthest().distance)
+                    {
+                        search_ctx.insert(nn);
+                    }
+                }
+            }
+        }
+
+        hops++;
+    }
+
+    // Step 3: Extract results from result_heap
+    std::vector<Neighbor> final_results;
+    while (!result_heap.empty())
+    {
+        final_results.push_back(result_heap.top());
+        result_heap.pop();
+    }
+
+    // Sort by distance (ascending)
+    std::sort(final_results.begin(), final_results.end());
+
+    // Step 4: Backfill if results are insufficient
+    // If we don't have enough results, use IVF candidates to fill
+    if (final_results.size() < k_search)
+    {
+        diskann::cout << "Warning: Only found " << final_results.size()
+                      << " results, backfilling from " << candidate_ids.size()
+                      << " candidates..." << std::endl;
+
+        // Compute distances for all candidates
+        std::vector<Neighbor> all_candidates;
+        for (uint32_t cand_id : candidate_ids)
+        {
+            if (cand_id >= _num_points)
+                continue;
+
+            // Skip if already in results
+            bool already_in_results = false;
+            for (const auto &res : final_results)
+            {
+                if (res.id == cand_id)
+                {
+                    already_in_results = true;
+                    break;
+                }
+            }
+            if (already_in_results)
+                continue;
+
+            compute_dists(&cand_id, 1, dist_scratch);
+            all_candidates.push_back(Neighbor(cand_id, dist_scratch[0]));
+        }
+
+        // Sort candidates by distance
+        std::sort(all_candidates.begin(), all_candidates.end());
+
+        // Add candidates to fill up to k_search
+        for (const auto &cand : all_candidates)
+        {
+            if (final_results.size() >= k_search)
+                break;
+            final_results.push_back(cand);
+        }
+    }
+
+    // Step 5: Copy results to output arrays
+    size_t result_count = std::min((size_t)k_search, final_results.size());
+    for (size_t i = 0; i < result_count; i++)
+    {
+        indices[i] = final_results[i].id;
+        distances[i] = final_results[i].distance;
+    }
+
+    // Fill remaining with sentinel values if needed
+    for (size_t i = result_count; i < k_search; i++)
+    {
+        indices[i] = 0;
+        distances[i] = std::numeric_limits<float>::max();
+    }
+
+    if (stats != nullptr)
+    {
+        stats->total_us = (float)query_timer.elapsed();
+    }
+}
+
 template <typename T, typename LabelT> uint64_t PQFlashIndex<T, LabelT>::get_data_dim()
 {
     return _data_dim;

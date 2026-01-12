@@ -1,0 +1,17 @@
+[Load] Index loaded. Universal count: 1001, Total unique tags: 99
+[Loader] Found 100000 vectors, Dim = 128
+>>> [Filter] Expr: (3&5)|7
+>>> [Filter] Candidates: 3622 (Parsed in 253 us)
+>>> [Search] Starting OMP+AVX2 scan...
+>>> [Search] Scan done in 3.069 ms.
+>>> [Result] Top 10:
+  Rank 1: ID=66378 Dist=21.1887
+  Rank 2: ID=91915 Dist=23.4248
+  Rank 3: ID=9376 Dist=23.5062
+  Rank 4: ID=13775 Dist=23.5197
+  Rank 5: ID=46142 Dist=23.6082
+  Rank 6: ID=86978 Dist=23.6926
+  Rank 7: ID=34248 Dist=23.8275
+  Rank 8: ID=77048 Dist=23.886
+  Rank 9: ID=65333 Dist=24.0004
+  Rank 10: ID=13336 Dist=24.0716

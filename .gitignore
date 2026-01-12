@@ -378,3 +378,7 @@ gperftools
 
 # Rust
 rust/target
+
+# Old CRoaring location (moved to third_party/)
+test_ivf/CRoaring/
+test_ivf/build/

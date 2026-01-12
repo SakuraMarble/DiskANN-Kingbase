@@ -28,6 +28,33 @@ target_link_libraries(test_streaming_scenario ${PROJECT_NAME} ${DISKANN_TOOLS_TC
 add_executable(test_insert_deletes_consolidate test_insert_deletes_consolidate.cpp)
 target_link_libraries(test_insert_deletes_consolidate ${PROJECT_NAME} ${DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS} Boost::program_options)
 
+# Hybrid search with inverted index
+# Note: This requires the InvertedIndex implementation from test_ivf/
+add_executable(hybrid_search_disk_index
+    hybrid_search_disk_index.cpp
+    ${CMAKE_SOURCE_DIR}/test_ivf/InvertedIndex.cpp
+)
+target_include_directories(hybrid_search_disk_index PRIVATE ${CMAKE_SOURCE_DIR}/test_ivf)
+target_include_directories(hybrid_search_disk_index PRIVATE ${CMAKE_SOURCE_DIR}/third_party/CRoaring/include)
+target_link_libraries(hybrid_search_disk_index
+    ${PROJECT_NAME}
+    ${DISKANN_ASYNC_LIB}
+    ${DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS}
+    Boost::program_options
+)
+
+# Add AVX2 support for hybrid search
+if(MSVC)
+    target_compile_options(hybrid_search_disk_index PRIVATE /arch:AVX2 /openmp /O2)
+else()
+    target_compile_options(hybrid_search_disk_index PRIVATE -march=native -O3 -fopenmp)
+endif()
+
+# Link Roaring library
+# We need to ensure CRoaring is built first
+add_subdirectory(${CMAKE_SOURCE_DIR}/third_party/CRoaring ${CMAKE_BINARY_DIR}/third_party/CRoaring)
+target_link_libraries(hybrid_search_disk_index roaring::roaring)
+
 if (NOT MSVC)
     install(TARGETS build_memory_index
             build_stitched_index
@@ -37,6 +64,7 @@ if (NOT MSVC)
             range_search_disk_index
             test_streaming_scenario
             test_insert_deletes_consolidate
+            hybrid_search_disk_index
             RUNTIME
     )
 endif()
