@@ -1918,7 +1918,8 @@ void PQFlashIndex<T, LabelT>::cached_beam_search_with_multi_entry(
             // Pruning check: if search_ctx is full and current node is too far, stop
             if (search_ctx.size() >= l_search)
             {
-                auto furthest_in_ctx = search_ctx.furthest();
+                // Get the furthest node in search_ctx (last element in sorted array)
+                auto furthest_in_ctx = search_ctx[search_ctx.size() - 1];
                 if (nbr.distance > furthest_in_ctx.distance)
                 {
                     break;
@@ -2024,7 +2025,8 @@ void PQFlashIndex<T, LabelT>::cached_beam_search_with_multi_entry(
 
                     // Branch B: Maintain search_ctx (only look at distance, ignore labels)
                     Neighbor nn(id, dist);
-                    if (search_ctx.size() < l_search || dist < search_ctx.furthest().distance)
+                    if (search_ctx.size() < l_search ||
+                        (search_ctx.size() > 0 && dist < search_ctx[search_ctx.size() - 1].distance))
                     {
                         search_ctx.insert(nn);
                     }
@@ -2090,7 +2092,8 @@ void PQFlashIndex<T, LabelT>::cached_beam_search_with_multi_entry(
 
                     // Branch B: Maintain search_ctx (only look at distance, ignore labels)
                     Neighbor nn(id, dist);
-                    if (search_ctx.size() < l_search || dist < search_ctx.furthest().distance)
+                    if (search_ctx.size() < l_search ||
+                        (search_ctx.size() > 0 && dist < search_ctx[search_ctx.size() - 1].distance))
                     {
                         search_ctx.insert(nn);
                     }

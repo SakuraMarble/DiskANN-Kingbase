@@ -50,10 +50,12 @@ else()
     target_compile_options(hybrid_search_disk_index PRIVATE -march=native -O3 -fopenmp)
 endif()
 
-# Link Roaring library
-# We need to ensure CRoaring is built first
-add_subdirectory(${CMAKE_SOURCE_DIR}/third_party/CRoaring ${CMAKE_BINARY_DIR}/third_party/CRoaring)
-target_link_libraries(hybrid_search_disk_index roaring::roaring)
+# Link Roaring library (already built in main CMakeLists.txt)
+if(TARGET roaring::roaring)
+    target_link_libraries(hybrid_search_disk_index roaring::roaring)
+else()
+    message(WARNING "roaring::roaring target not found. Make sure CRoaring submodule is initialized.")
+endif()
 
 if (NOT MSVC)
     install(TARGETS build_memory_index

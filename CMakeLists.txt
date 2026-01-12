@@ -299,6 +299,30 @@ else()
     endif()
 endif()
 
+# Add CRoaring third-party library (required for hybrid search)
+# Ensure compiler paths are absolute before adding subdirectory
+if(NOT IS_ABSOLUTE "${CMAKE_CXX_COMPILER}")
+    find_program(CMAKE_CXX_COMPILER_ABSOLUTE NAMES ${CMAKE_CXX_COMPILER})
+    if(CMAKE_CXX_COMPILER_ABSOLUTE)
+        set(CMAKE_CXX_COMPILER "${CMAKE_CXX_COMPILER_ABSOLUTE}" CACHE FILEPATH "C++ compiler" FORCE)
+    endif()
+endif()
+if(NOT IS_ABSOLUTE "${CMAKE_C_COMPILER}")
+    find_program(CMAKE_C_COMPILER_ABSOLUTE NAMES ${CMAKE_C_COMPILER})
+    if(CMAKE_C_COMPILER_ABSOLUTE)
+        set(CMAKE_C_COMPILER "${CMAKE_C_COMPILER_ABSOLUTE}" CACHE FILEPATH "C compiler" FORCE)
+    endif()
+endif()
+
+# Now add CRoaring with absolute compiler paths
+if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/CRoaring/CMakeLists.txt")
+    add_subdirectory(third_party/CRoaring EXCLUDE_FROM_ALL)
+    message(STATUS "CRoaring found and will be built")
+else()
+    message(WARNING "CRoaring not found at ${CMAKE_SOURCE_DIR}/third_party/CRoaring. "
+                    "Please run: git submodule update --init --recursive")
+endif()
+
 add_subdirectory(src)
 if (NOT PYBIND)
     add_subdirectory(apps)
