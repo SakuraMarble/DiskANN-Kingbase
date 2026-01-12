@@ -24,7 +24,7 @@ add_executable(tsv_to_bin tsv_to_bin.cpp)
 add_executable(bin_to_tsv bin_to_tsv.cpp)
 
 add_executable(int8_to_float int8_to_float.cpp)
-target_link_libraries(int8_to_float ${PROJECT_NAME})
+target_link_libraries(int8_to_float ${PROJECT_NAME} ${DISKANN_ASYNC_LIB})
 
 add_executable(int8_to_float_scale int8_to_float_scale.cpp)
 target_link_libraries(int8_to_float_scale ${PROJECT_NAME})
